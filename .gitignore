@@ -6,3 +6,4 @@ data/raw/
 *.tar.bz2
 *.tar.gzdata/features/
 extract.log
+data/features/
