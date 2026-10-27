@@ -4,4 +4,5 @@ __pycache__/
 .env
 data/raw/
 *.tar.bz2
-*.tar.gz
+*.tar.gzdata/features/
+extract.log
