@@ -3,8 +3,9 @@ __pycache__/
 .ipynb_checkpoints/
 .env
 data/raw/
-*.tar.bz2
-*.tar.gzdata/features/
-extract.log
 data/features/
 data/aligned/
+*.tar.bz2
+*.tar.gz
+extract.log
+models/gmm_M*.npz
