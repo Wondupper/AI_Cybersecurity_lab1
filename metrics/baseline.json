@@ -1,0 +1,12 @@
+{
+ "metric": "MCD (дБ, кепстр WORLD, коэф. 0 не учитывается), меньше - лучше",
+ "value_gmm": 7.630658863971233,
+ "value_copy_source": 12.18458648235762,
+ "value_mean_target": 14.056301288859466,
+ "n_test_phrases": 113,
+ "n_test_frames": 72729,
+ "seed": 42,
+ "n_components": 16,
+ "train_frames_used": 100000,
+ "data_version": "CMU ARCTIC v0.95 bdl/slt; splits.json sha256=6a47f85e3a7db4f9e511d4cac221993d05b747c301bcf0239bfacbba81349fe2"
+}

@@ -8,3 +8,4 @@ data/aligned/
 *.tar.bz2
 *.tar.gz
 *.log
+out/
