@@ -7,5 +7,4 @@ data/features/
 data/aligned/
 *.tar.bz2
 *.tar.gz
-extract.log
-models/gmm_M*.npz
+*.log

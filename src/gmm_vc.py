@@ -15,7 +15,7 @@ def fit(X, Y, n_components, seed, max_frames=None):
         X, Y = X[idx], Y[idx]
     Z = np.hstack([(X - mx) / sx, (Y - my) / sy])
     gmm = GaussianMixture(n_components=n_components, covariance_type="full",
-                          reg_covar=1e-4, max_iter=100, random_state=seed)
+                          reg_covar=1e-4, max_iter=300, random_state=seed)
     gmm.fit(Z)
     sxx = gmm.covariances_[:, :d, :d]
     syx = gmm.covariances_[:, d:, :d]
