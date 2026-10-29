@@ -7,3 +7,4 @@ data/raw/
 *.tar.gzdata/features/
 extract.log
 data/features/
+data/aligned/
