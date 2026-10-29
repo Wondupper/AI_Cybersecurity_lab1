@@ -9,3 +9,4 @@ data/aligned/
 *.tar.gz
 *.log
 out/
+jupyter.out
