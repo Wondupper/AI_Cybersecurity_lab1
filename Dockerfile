@@ -1,8 +1,8 @@
 # Образ выполняет одну проверку (smoke): сверяет хэши модели, загружает её и преобразует тестовый WAV.
-# Базовый образ закреплён версией. Точный digest добавляется после `docker pull` (см. README).
+# Базовый образ закреплён версией и digest (получен командой docker pull, 2026-11-01).
 
 # --- этап сборки: компилятор нужен только для pyworld (колеса под Python 3.14 нет)
-FROM python:3.14.4-slim-trixie AS build
+FROM python:3.14.4-slim-trixie@sha256:2ca02f32b4d9d893863367ce07ec1972819f476dd38d8612f2a9cb6a41cbb727 AS build
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential \
@@ -12,7 +12,7 @@ COPY requirements-runtime.txt .
 RUN pip wheel --wheel-dir /wheels -r requirements-runtime.txt
 
 # --- рабочий образ: только runtime-зависимости, без компилятора, pytest и Jupyter
-FROM python:3.14.4-slim-trixie
+FROM python:3.14.4-slim-trixie@sha256:2ca02f32b4d9d893863367ce07ec1972819f476dd38d8612f2a9cb6a41cbb727
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app/src
 RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin app
