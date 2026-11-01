@@ -41,7 +41,7 @@ PY
     mkdir -p out
     python src/make_weak_model.py models/gmm_M16.npz out/weak_model.npz
     cp out/weak_model.npz models/gmm_M16.npz
-    ( cd models && sha256sum gmm_M16.npz f0_stats.json > SHA256SUMS )
+    sha256sum models/gmm_M16.npz models/f0_stats.json > models/SHA256SUMS
     git add models
     git commit -q -m "demo: константная модель (должен сработать model gate)"
     ;;
