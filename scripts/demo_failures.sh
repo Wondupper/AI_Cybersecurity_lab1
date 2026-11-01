@@ -7,7 +7,7 @@ set -euo pipefail
 case "${1:-}" in
   test)     branch=demo/test-failure ;;
   data)     branch=demo/data-gate-failure ;;
-  model)    branch=demo/model-gate-failure ;;
+  model)    branch=${MODEL_DEMO_BRANCH:-demo/model-gate-failure} ;;
   security) branch=demo/security-gate-failure ;;
   *) echo "использование: $0 test|data|model|security"; exit 2 ;;
 esac
