@@ -16,7 +16,17 @@
   ]
  },
  "trivy": {
-  "block_severities": ["CRITICAL", "UNKNOWN"],
-  "allow": []
+  "block_severities": [
+   "CRITICAL",
+   "UNKNOWN"
+  ],
+  "allow": [
+   {
+    "id": "CVE-2026-82560",
+    "package": "perl-base 5.40.1-6+deb13u1",
+    "severity": "high (CVSS 3.x 7.5 по данным вендоров; Trivy показывает UNKNOWN)",
+    "reason": "Отказ в обслуживании в Pod::Text при форматировании POD-документа. Исправления в Debian trixie пока нет, пакет обязателен для системы. Perl в контейнере не запускается, POD-документы не обрабатываются. Проверять заново при каждом обновлении базового образа."
+   }
+  ]
  }
 }

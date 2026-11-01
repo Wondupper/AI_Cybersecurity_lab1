@@ -15,9 +15,11 @@ RUN pip wheel --wheel-dir /wheels -r requirements-runtime.txt
 FROM python:3.14.4-slim-trixie@sha256:2ca02f32b4d9d893863367ce07ec1972819f476dd38d8612f2a9cb6a41cbb727
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app/src
-# базовый образ закреплён digest, но в нём есть пакеты с уже вышедшими исправлениями безопасности: обновляем их
+# базовый образ закреплён digest, но в нём есть пакеты с уже вышедшими исправлениями безопасности: обновляем их.
+# libsqlite3-0 проекту не нужен (модуль sqlite3 не используется), а в нём есть находки без исправления: удаляем
 RUN apt-get update \
     && apt-get upgrade -y --no-install-recommends \
+    && apt-get purge -y --auto-remove libsqlite3-0 \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin app
 COPY requirements-runtime.txt /tmp/requirements-runtime.txt
