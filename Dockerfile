@@ -15,6 +15,10 @@ RUN pip wheel --wheel-dir /wheels -r requirements-runtime.txt
 FROM python:3.14.4-slim-trixie@sha256:2ca02f32b4d9d893863367ce07ec1972819f476dd38d8612f2a9cb6a41cbb727
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app/src
+# perl-base в базовом образе содержит CRITICAL-уязвимости (исправлены в 5.40.1-6+deb13u1): обновляем только его
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends --only-upgrade perl-base \
+    && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin app
 COPY requirements-runtime.txt /tmp/requirements-runtime.txt
 RUN --mount=type=bind,from=build,source=/wheels,target=/wheels \
