@@ -1,0 +1,15 @@
+# Зависимости приложения (предсказание, gates, Docker-образ). Все версии закреплены.
+# setuptools закреплён: pyworld 0.3.5 импортирует pkg_resources, которого нет в setuptools 84.1.0.
+numpy==2.5.4
+scipy==1.18.1
+scikit-learn==1.9.1
+joblib==1.6.0
+threadpoolctl==3.7.0
+cloudpickle==3.1.2
+narwhals==2.28.0
+soundfile==0.14.0
+cffi==2.1.1
+pycparser==3.11
+typing_extensions==4.16.0
+pyworld==0.3.5
+setuptools==80.10.2

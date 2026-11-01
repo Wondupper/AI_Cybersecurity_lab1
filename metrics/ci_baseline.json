@@ -1,0 +1,10 @@
+{
+ "metric": "MCD (дБ, кепстр WORLD, коэф. 0 не учитывается), меньше - лучше",
+ "direction": "lower_is_better",
+ "baseline_value": 7.619430996163319,
+ "relative_tolerance": 0.05,
+ "absolute_threshold": null,
+ "data_version": "CMU ARCTIC v0.95 bdl/slt; control sample from val of data/splits.json sha256=6a47f85e3a7db4f9e511d4cac221993d05b747c301bcf0239bfacbba81349fe2",
+ "control_sha256": "8c5746a60a48f639ac4f08eb64f3433b0ad8f37b9e4d01596d67ae82a2cd77ac",
+ "model_sha256": "2fb7b78776dbd63c7e00297642a117288ea8ead4983b0a792cc158ae1b241e43"
+}

@@ -90,7 +90,7 @@ Kominek J., Black A. W. The CMU ARCTIC speech databases. 5th ISCA Speech Synthes
     python src/f0_stats.py                   # статистика F0 по train -> models/f0_stats.json
     python src/align.py train val test       # DTW -> data/aligned/
     python src/train_gmm.py 16 100000        # обучение, MCD на val; перезаписывает models/gmm_M16.npz
-    python src/evaluate.py                   # единственная оценка на test -> metrics/baseline.json
+    python src/evaluate.py [модель]          # единственная оценка на test -> metrics/test_eval.json (baseline.json не трогает)
     python -m pytest tests/ -q               # 12 тестов
     python -m bandit -r src/                 # статический анализ
     python src/predict.py in.wav out.wav     # преобразование одной записи
@@ -106,3 +106,50 @@ WAV, PCM 16 бит, 16 кГц, один канал; длительность д�
 - Звучание проверено на слух только на одной фразе.
 - Слабый шум (SNR 30 дБ) сильно меняет результат (MCD между результатами 8,0 дБ); изменение громкости почти не влияет (0,4 дБ).
 - `setuptools` закреплён на 80.10.2: `pyworld` импортирует `pkg_resources`, которого нет в 84.1.0. `pip-audit` сообщает 2 уязвимости setuptools (PYSEC-2026-3447, GHSA-xmj3-9gf7-h52w); риск принят, пакет используется только при импорте `pyworld`.
+
+## CI/CD и проверки качества
+
+Pipeline (`.github/workflows/ci.yml`) запускается при push и pull request. Три задания идут друг за другом: следующее стартует только после успешного предыдущего.
+
+| Задание | Шаги |
+|---|---|
+| `quality` | Ruff, Bandit, pytest, аудит зависимостей |
+| `gates` | проверка SHA256 модели и контрольной выборки, data gate, model gate |
+| `image` | сборка образа, запуск без root, smoke, Trivy (Dockerfile и образ) |
+
+Отчёты (pytest, Bandit, pip-audit, model gate, Trivy, версии инструментов, commit и хэши) сохраняются как артефакты запуска, в том числе при сбое. Права CI: только чтение кода, секреты не используются. Версии действий закреплены коммитами, у заданий есть ограничение времени.
+
+### Зависимости
+- `requirements-runtime.txt` - зависимости приложения и образа (всё закреплено);
+- `requirements-dev.txt` - инструменты проверок (Ruff, Bandit, pytest, pip-audit);
+- `requirements.txt` - полный `pip freeze` окружения ВМ.
+
+### Политика безопасности (`configs/security_policy.json`)
+- **pip-audit - строгая политика:** отказ при любой находке, кроме двух записей setuptools 80.10.2 (PYSEC-2026-3447, severity medium; GHSA-xmj3-9gf7-h52w, severity low - по osv.dev). Причина: версия закреплена, так как `pyworld` импортирует `pkg_resources`, которого нет в setuptools 84.1.0. Любая новая находка, в том числе с неизвестной severity, останавливает сборку. Пакет из requirements, не попавший в отчёт, тоже считается непроверенным. Код возврата pip-audit передаётся в `src/security_gate.py`, пустой или повреждённый отчёт - отказ.
+- **Trivy:** образ блокируется при находках CRITICAL и UNKNOWN (`trivy image --severity CRITICAL --exit-code 1` плюс проверка отчёта). Ошибка скачивания базы или сканирования - отказ, а не «уязвимостей нет». Dockerfile проверяется командой `trivy config --exit-code 1`.
+
+### Контрольная выборка и data gate
+`data/control/control_val.npz`: 20 фраз из val (выровненные пары кадров), описание и схема - в `data/control/README.md`, эталонный SHA256 - в `data/control/SHA256SUMS`. Правила - `configs/data_gate.json` (обязательные массивы, типы, форма (N, 24), NaN/Inf, границы значений, число фраз и кадров, хэш и версия данных). Нарушение даёт код возврата 1.
+
+### Model gate
+Метрика MCD (меньше - лучше), кандидат оценивается на контрольной выборке тем же кодом `src/mcd.py`. Проходит при `candidate <= baseline * 1.05`. Baseline и допуск лежат в `metrics/ci_baseline.json` и автоматически не перезаписываются (`--init-baseline` отказывается работать, если файл есть). Отсутствующая, нечисловая метрика, плохой baseline, другая версия данных или другой хэш выборки - отказ. Результат сравнения и код возврата пишутся в `reports/model_gate.json`. Gate не заменяет финальную оценку на test (`metrics/baseline.json`, ЛР2).
+
+### Docker
+Образ `ml-project:lab3`: официальный `python:3.14.4-slim-trixie`, два этапа (компилятор только на этапе сборки), пользователь `app` (UID 10001), `HEALTHCHECK NONE`, `.dockerignore` пропускает только нужные файлы, модель включена явно. Контейнер выполняет smoke-проверку: сверяет хэши модели, загружает её и преобразует синтетический WAV.
+
+    docker build -t ml-project:lab3 .
+    docker run --rm --entrypoint id ml-project:lab3 -u
+    docker run --rm --network none --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges ml-project:lab3
+
+### Локальная проверка
+    ruff check src/ tests/
+    python -m bandit -r src/
+    python -m pytest tests/ -q
+    python -m pip_audit --no-deps --disable-pip -r requirements-runtime.txt -r requirements-dev.txt -f json -o reports/pip-audit.json
+    python src/security_gate.py pip-audit reports/pip-audit.json --tool-exit-code 0 --requirements requirements-runtime.txt requirements-dev.txt
+    python src/data_gate.py
+    python src/model_gate.py
+    python src/smoke.py
+
+### Демонстрации отказа
+`scripts/demo_failures.sh test|data|model|security` создаёт отдельную ветку с одним нарушением и отправляет её на GitHub: упавший тест, NaN в контрольной выборке, константная модель, уязвимая версия urllib3. Основная ветка не меняется.

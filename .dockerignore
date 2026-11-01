@@ -1,0 +1,20 @@
+# Всё, что не перечислено в исключениях ниже, в контекст сборки не попадает.
+.git
+.github
+.venv
+.env
+*.log
+data
+notebooks
+tests
+reports
+out
+*
+!requirements-runtime.txt
+!src/predict.py
+!src/gmm_vc.py
+!src/checksums.py
+!src/smoke.py
+!models/gmm_M16.npz
+!models/f0_stats.json
+!models/SHA256SUMS

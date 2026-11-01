@@ -1,0 +1,1629 @@
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+index 0000000..e88c47e
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,20 @@
++# Всё, что не перечислено в исключениях ниже, в контекст сборки не попадает.
++.git
++.github
++.venv
++.env
++*.log
++data
++notebooks
++tests
++reports
++out
++*
++!requirements-runtime.txt
++!src/predict.py
++!src/gmm_vc.py
++!src/checksums.py
++!src/smoke.py
++!models/gmm_M16.npz
++!models/f0_stats.json
++!models/SHA256SUMS
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+index 0000000..4787fbb
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,133 @@
++name: CI
++
++on:
++  push:
++  pull_request:
++
++# минимальные права: только чтение кода; секреты не используются
++permissions:
++  contents: read
++
++env:
++  PYTHON_VERSION: "3.14.4"
++
++jobs:
++  # 1. код: линтер, Bandit, тесты, аудит зависимостей
++  quality:
++    runs-on: ubuntu-24.04
++    timeout-minutes: 25
++    steps:
++      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++        with:
++          persist-credentials: false
++      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
++        with:
++          python-version: ${{ env.PYTHON_VERSION }}
++          cache: pip
++          cache-dependency-path: requirements-*.txt
++      - name: Установка зависимостей
++        run: python -m pip install -r requirements-dev.txt
++      - name: Версии инструментов
++        run: |
++          mkdir -p reports
++          { python --version; ruff --version; python -m bandit --version | head -1; python -m pytest --version; python -m pip_audit --version; } | tee reports/tool-versions.txt
++      - name: Ruff
++        run: ruff check src/ tests/
++      - name: Bandit
++        run: |
++          rc=0
++          python -m bandit -r src/ -f txt -o reports/bandit.txt || rc=$?
++          cat reports/bandit.txt
++          exit "$rc"
++      - name: Тесты
++        run: python -m pytest tests/ -q --junitxml=reports/pytest.xml
++      - name: Аудит зависимостей
++        run: |
++          # код возврата pip-audit не скрывается: он передаётся в gate, который проверяет и отчёт
++          rc=0
++          python -m pip_audit --no-deps --disable-pip -r requirements-runtime.txt -r requirements-dev.txt -f json -o reports/pip-audit.json || rc=$?
++          echo "pip-audit exit code: $rc"
++          python src/security_gate.py pip-audit reports/pip-audit.json --tool-exit-code "$rc" --requirements requirements-runtime.txt requirements-dev.txt
++      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
++        if: always()
++        with:
++          name: reports-quality
++          path: reports/
++          if-no-files-found: warn
++
++  # 2. данные и модель: целостность, data gate, model gate
++  gates:
++    needs: quality
++    runs-on: ubuntu-24.04
++    timeout-minutes: 15
++    steps:
++      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++        with:
++          persist-credentials: false
++      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
++        with:
++          python-version: ${{ env.PYTHON_VERSION }}
++          cache: pip
++          cache-dependency-path: requirements-*.txt
++      - name: Установка зависимостей
++        run: python -m pip install -r requirements-dev.txt
++      - name: Целостность модели и контрольной выборки
++        run: |
++          mkdir -p reports
++          sha256sum -c models/SHA256SUMS
++          sha256sum -c data/control/SHA256SUMS
++          { echo "commit: $GITHUB_SHA"; echo "ref: $GITHUB_REF"; sha256sum models/gmm_M16.npz models/f0_stats.json data/control/control_val.npz; } | tee reports/run-info.txt
++      - name: Data quality gate
++        run: python src/data_gate.py
++      - name: Model quality gate
++        run: python src/model_gate.py --out reports/model_gate.json
++      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
++        if: always()
++        with:
++          name: reports-gates
++          path: reports/
++          if-no-files-found: warn
++
++  # 3. образ: сборка, запуск без root, smoke, сканирование
++  image:
++    needs: gates
++    runs-on: ubuntu-24.04
++    timeout-minutes: 30
++    steps:
++      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++        with:
++          persist-credentials: false
++      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
++        with:
++          python-version: ${{ env.PYTHON_VERSION }}
++      - name: Сборка образа
++        run: docker build -t ml-project:lab3 .
++      - name: Образ работает без root
++        run: |
++          mkdir -p reports
++          uid=$(docker run --rm --entrypoint id ml-project:lab3 -u)
++          echo "uid в контейнере: $uid" | tee reports/container-user.txt
++          test "$uid" != "0"
++      - name: Smoke-проверка модели в контейнере
++        run: |
++          docker run --rm --network none --read-only --tmpfs /tmp --cap-drop ALL \
++            --security-opt no-new-privileges ml-project:lab3 | tee reports/smoke.txt
++      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
++        with:
++          version: v0.76.1
++          cache: true
++      - name: Trivy, проверка Dockerfile
++        run: |
++          trivy --version | tee reports/trivy-version.txt
++          trivy config --exit-code 1 --format json --output reports/trivy-config.json Dockerfile
++      - name: Trivy, сканирование образа
++        run: |
++          trivy image --format json --output reports/trivy-image.json ml-project:lab3
++          trivy image --severity CRITICAL --exit-code 1 ml-project:lab3
++          python src/security_gate.py trivy reports/trivy-image.json
++      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
++        if: always()
++        with:
++          name: reports-image
++          path: reports/
++          if-no-files-found: warn
+diff --git a/.gitignore b/.gitignore
+index 3da51e7..a49f124 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -10,3 +10,4 @@ data/aligned/
+ *.log
+ out/
+ jupyter.out
++reports/
+diff --git a/Dockerfile b/Dockerfile
+new file mode 100644
+index 0000000..d76e66e
+--- /dev/null
++++ b/Dockerfile
+@@ -0,0 +1,30 @@
++# Образ выполняет одну проверку (smoke): сверяет хэши модели, загружает её и преобразует тестовый WAV.
++# Базовый образ закреплён версией. Точный digest добавляется после `docker pull` (см. README).
++
++# --- этап сборки: компилятор нужен только для pyworld (колеса под Python 3.14 нет)
++FROM python:3.14.4-slim-trixie AS build
++ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1
++RUN apt-get update \
++    && apt-get install -y --no-install-recommends build-essential \
++    && rm -rf /var/lib/apt/lists/*
++WORKDIR /build
++COPY requirements-runtime.txt .
++RUN pip wheel --wheel-dir /wheels -r requirements-runtime.txt
++
++# --- рабочий образ: только runtime-зависимости, без компилятора, pytest и Jupyter
++FROM python:3.14.4-slim-trixie
++ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 \
++    PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app/src
++RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin app
++COPY requirements-runtime.txt /tmp/requirements-runtime.txt
++RUN --mount=type=bind,from=build,source=/wheels,target=/wheels \
++    pip install --no-index --find-links=/wheels -r /tmp/requirements-runtime.txt \
++    && rm /tmp/requirements-runtime.txt
++WORKDIR /app
++# в образ включаются только нужные файлы; модель добавляется явно
++COPY src/predict.py src/gmm_vc.py src/checksums.py src/smoke.py ./src/
++COPY models/gmm_M16.npz models/f0_stats.json models/SHA256SUMS ./models/
++USER 10001
++# контейнер выполняет одну команду и завершается, поэтому проверка состояния не нужна
++HEALTHCHECK NONE
++CMD ["python", "src/smoke.py"]
+diff --git a/README.md b/README.md
+index 017ce49..ef97382 100644
+--- a/README.md
++++ b/README.md
+@@ -90,7 +90,7 @@ Kominek J., Black A. W. The CMU ARCTIC speech databases. 5th ISCA Speech Synthes
+     python src/f0_stats.py                   # статистика F0 по train -> models/f0_stats.json
+     python src/align.py train val test       # DTW -> data/aligned/
+     python src/train_gmm.py 16 100000        # обучение, MCD на val; перезаписывает models/gmm_M16.npz
+-    python src/evaluate.py                   # единственная оценка на test -> metrics/baseline.json
++    python src/evaluate.py [модель]          # единственная оценка на test -> metrics/test_eval.json (baseline.json не трогает)
+     python -m pytest tests/ -q               # 12 тестов
+     python -m bandit -r src/                 # статический анализ
+     python src/predict.py in.wav out.wav     # преобразование одной записи
+@@ -106,3 +106,50 @@ WAV, PCM 16 бит, 16 кГц, один канал; длительность д
+ - Звучание проверено на слух только на одной фразе.
+ - Слабый шум (SNR 30 дБ) сильно меняет результат (MCD между результатами 8,0 дБ); изменение громкости почти не влияет (0,4 дБ).
+ - `setuptools` закреплён на 80.10.2: `pyworld` импортирует `pkg_resources`, которого нет в 84.1.0. `pip-audit` сообщает 2 уязвимости setuptools (PYSEC-2026-3447, GHSA-xmj3-9gf7-h52w); риск принят, пакет используется только при импорте `pyworld`.
++
++## CI/CD и проверки качества
++
++Pipeline (`.github/workflows/ci.yml`) запускается при push и pull request. Три задания идут друг за другом: следующее стартует только после успешного предыдущего.
++
++| Задание | Шаги |
++|---|---|
++| `quality` | Ruff, Bandit, pytest, аудит зависимостей |
++| `gates` | проверка SHA256 модели и контрольной выборки, data gate, model gate |
++| `image` | сборка образа, запуск без root, smoke, Trivy (Dockerfile и образ) |
++
++Отчёты (pytest, Bandit, pip-audit, model gate, Trivy, версии инструментов, commit и хэши) сохраняются как артефакты запуска, в том числе при сбое. Права CI: только чтение кода, секреты не используются. Версии действий закреплены коммитами, у заданий есть ограничение времени.
++
++### Зависимости
++- `requirements-runtime.txt` - зависимости приложения и образа (всё закреплено);
++- `requirements-dev.txt` - инструменты проверок (Ruff, Bandit, pytest, pip-audit);
++- `requirements.txt` - полный `pip freeze` окружения ВМ.
++
++### Политика безопасности (`configs/security_policy.json`)
++- **pip-audit - строгая политика:** отказ при любой находке, кроме двух записей setuptools 80.10.2 (PYSEC-2026-3447, severity medium; GHSA-xmj3-9gf7-h52w, severity low - по osv.dev). Причина: версия закреплена, так как `pyworld` импортирует `pkg_resources`, которого нет в setuptools 84.1.0. Любая новая находка, в том числе с неизвестной severity, останавливает сборку. Пакет из requirements, не попавший в отчёт, тоже считается непроверенным. Код возврата pip-audit передаётся в `src/security_gate.py`, пустой или повреждённый отчёт - отказ.
++- **Trivy:** образ блокируется при находках CRITICAL и UNKNOWN (`trivy image --severity CRITICAL --exit-code 1` плюс проверка отчёта). Ошибка скачивания базы или сканирования - отказ, а не «уязвимостей нет». Dockerfile проверяется командой `trivy config --exit-code 1`.
++
++### Контрольная выборка и data gate
++`data/control/control_val.npz`: 20 фраз из val (выровненные пары кадров), описание и схема - в `data/control/README.md`, эталонный SHA256 - в `data/control/SHA256SUMS`. Правила - `configs/data_gate.json` (обязательные массивы, типы, форма (N, 24), NaN/Inf, границы значений, число фраз и кадров, хэш и версия данных). Нарушение даёт код возврата 1.
++
++### Model gate
++Метрика MCD (меньше - лучше), кандидат оценивается на контрольной выборке тем же кодом `src/mcd.py`. Проходит при `candidate <= baseline * 1.05`. Baseline и допуск лежат в `metrics/ci_baseline.json` и автоматически не перезаписываются (`--init-baseline` отказывается работать, если файл есть). Отсутствующая, нечисловая метрика, плохой baseline, другая версия данных или другой хэш выборки - отказ. Результат сравнения и код возврата пишутся в `reports/model_gate.json`. Gate не заменяет финальную оценку на test (`metrics/baseline.json`, ЛР2).
++
++### Docker
++Образ `ml-project:lab3`: официальный `python:3.14.4-slim-trixie`, два этапа (компилятор только на этапе сборки), пользователь `app` (UID 10001), `HEALTHCHECK NONE`, `.dockerignore` пропускает только нужные файлы, модель включена явно. Контейнер выполняет smoke-проверку: сверяет хэши модели, загружает её и преобразует синтетический WAV.
++
++    docker build -t ml-project:lab3 .
++    docker run --rm --entrypoint id ml-project:lab3 -u
++    docker run --rm --network none --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges ml-project:lab3
++
++### Локальная проверка
++    ruff check src/ tests/
++    python -m bandit -r src/
++    python -m pytest tests/ -q
++    python -m pip_audit --no-deps --disable-pip -r requirements-runtime.txt -r requirements-dev.txt -f json -o reports/pip-audit.json
++    python src/security_gate.py pip-audit reports/pip-audit.json --tool-exit-code 0 --requirements requirements-runtime.txt requirements-dev.txt
++    python src/data_gate.py
++    python src/model_gate.py
++    python src/smoke.py
++
++### Демонстрации отказа
++`scripts/demo_failures.sh test|data|model|security` создаёт отдельную ветку с одним нарушением и отправляет её на GitHub: упавший тест, NaN в контрольной выборке, константная модель, уязвимая версия urllib3. Основная ветка не меняется.
+diff --git a/configs/data_gate.json b/configs/data_gate.json
+new file mode 100644
+index 0000000..3d20514
+--- /dev/null
++++ b/configs/data_gate.json
+@@ -0,0 +1,14 @@
++{
++ "data_version": "CMU ARCTIC v0.95 bdl/slt; control sample from val of data/splits.json sha256=6a47f85e3a7db4f9e511d4cac221993d05b747c301bcf0239bfacbba81349fe2",
++ "file": "data/control/control_val.npz",
++ "checksum_file": "data/control/SHA256SUMS",
++ "required_arrays": ["X", "Y", "utt", "ids"],
++ "frame_dtype": "float32",
++ "n_features": 24,
++ "min_phrases": 15,
++ "max_phrases": 25,
++ "min_frames": 5000,
++ "max_frames": 50000,
++ "min_frames_per_phrase": 50,
++ "value_abs_max": 100.0
++}
+diff --git a/configs/security_policy.json b/configs/security_policy.json
+new file mode 100644
+index 0000000..c3bb262
+--- /dev/null
++++ b/configs/security_policy.json
+@@ -0,0 +1,22 @@
++{
++ "pip_audit": {
++  "allow": [
++   {
++    "id": "PYSEC-2026-3447",
++    "package": "setuptools 80.10.2",
++    "severity": "medium (osv.dev)",
++    "reason": "Версия закреплена: pyworld 0.3.5 импортирует pkg_resources, которого нет в setuptools 84.1.0. Код проекта setuptools не использует. Исправление есть в 83.0.0."
++   },
++   {
++    "id": "GHSA-xmj3-9gf7-h52w",
++    "package": "setuptools 80.10.2",
++    "severity": "low (osv.dev)",
++    "reason": "Версия закреплена по той же причине. Исправление есть в 84.1.0."
++   }
++  ]
++ },
++ "trivy": {
++  "block_severities": ["CRITICAL", "UNKNOWN"],
++  "allow": []
++ }
++}
+diff --git a/data/control/README.md b/data/control/README.md
+new file mode 100644
+index 0000000..7cbdd48
+--- /dev/null
++++ b/data/control/README.md
+@@ -0,0 +1,10 @@
++# Контрольная выборка для CI
++
++- **Источник:** CMU ARCTIC v0.95, дикторы bdl и slt (http://festvox.org/cmu_arctic/), выборка val из `data/splits.json`.
++- **Состав:** 20 фраз из val, выбраны случайно (`numpy.random.default_rng(42)`), скрипт `src/make_control.py`.
++- **Файл:** `control_val.npz`, контрольная сумма в `SHA256SUMS` (эталон хранится отдельно от файла).
++- **Схема:** `X` и `Y` - выровненные пары кадров (N, 24), float32: кепстр WORLD диктора bdl и slt;
++  `utt` - номер фразы для каждой пары (int32, по возрастанию); `ids` - имена фраз.
++- **Правила проверки:** `configs/data_gate.json`.
++- **Как используется:** data gate и model gate в CI. Это не тестовая выборка: финальная оценка модели делается на test отдельно.
++- Файл нельзя пересоздавать без обновления SHA256, `configs/data_gate.json` и `metrics/ci_baseline.json`.
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000..e550069
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,11 @@
++[tool.ruff]
++line-length = 120
++target-version = "py314"
++src = ["src", "tests"]
++
++[tool.ruff.lint]
++select = ["E", "F", "W", "I", "B"]
++
++[tool.ruff.lint.per-file-ignores]
++# make_notebook.py: длинные строки внутри текста ячеек ноутбука
++"src/make_notebook.py" = ["E501"]
+diff --git a/requirements-dev.txt b/requirements-dev.txt
+new file mode 100644
+index 0000000..8dd8cb8
+--- /dev/null
++++ b/requirements-dev.txt
+@@ -0,0 +1,36 @@
++# Инструменты проверок для CI и локальной работы. Все версии закреплены.
++-r requirements-runtime.txt
++pytest==9.1.1
++iniconfig==2.3.1
++packaging==26.3
++pluggy==1.7.0
++Pygments==2.21.0
++ruff==0.17.3
++bandit==1.9.4
++PyYAML==6.0.3
++stevedore==5.9.1
++rich==15.0.0
++markdown-it-py==4.2.0
++mdurl==0.1.2
++pip_audit==2.10.1
++CacheControl==0.14.4
++msgpack==1.2.3
++filelock==4.2.2
++requests==2.34.2
++certifi==2026.10.23
++charset-normalizer==3.5.2
++idna==3.20
++urllib3==2.8.0
++cyclonedx-python-lib==11.12.0
++packageurl-python==0.17.6
++py-serializable==2.1.0
++defusedxml==0.7.1
++license-expression==30.4.4
++boolean.py==5.0
++sortedcontainers==2.4.0
++pip-api==0.0.35
++pip-requirements-parser==32.0.1
++pyparsing==3.3.3
++platformdirs==4.13.4
++tomli==2.5.0
++tomli_w==1.2.0
+diff --git a/requirements-runtime.txt b/requirements-runtime.txt
+new file mode 100644
+index 0000000..df8ad7b
+--- /dev/null
++++ b/requirements-runtime.txt
+@@ -0,0 +1,15 @@
++# Зависимости приложения (предсказание, gates, Docker-образ). Все версии закреплены.
++# setuptools закреплён: pyworld 0.3.5 импортирует pkg_resources, которого нет в setuptools 84.1.0.
++numpy==2.5.4
++scipy==1.18.1
++scikit-learn==1.9.1
++joblib==1.6.0
++threadpoolctl==3.7.0
++cloudpickle==3.1.2
++narwhals==2.28.0
++soundfile==0.14.0
++cffi==2.1.1
++pycparser==3.11
++typing_extensions==4.16.0
++pyworld==0.3.5
++setuptools==80.10.2
+diff --git a/scripts/demo_failures.sh b/scripts/demo_failures.sh
+new file mode 100755
+index 0000000..98cf767
+--- /dev/null
++++ b/scripts/demo_failures.sh
+@@ -0,0 +1,58 @@
++#!/usr/bin/env bash
++# Демонстрации отказа CI. Каждый сценарий создаёт отдельную ветку от текущего коммита,
++# вносит одно нарушение, делает коммит и отправляет ветку на GitHub; затем возвращает исходную ветку.
++# Запуск из корня репозитория при чистом `git status`: scripts/demo_failures.sh test|data|model|security
++set -euo pipefail
++
++case "${1:-}" in
++  test)     branch=demo/test-failure ;;
++  data)     branch=demo/data-gate-failure ;;
++  model)    branch=demo/model-gate-failure ;;
++  security) branch=demo/security-gate-failure ;;
++  *) echo "использование: $0 test|data|model|security"; exit 2 ;;
++esac
++[ -z "$(git status --porcelain)" ] || { echo "рабочее дерево не чистое"; exit 1; }
++start=$(git rev-parse --abbrev-ref HEAD)
++git switch -c "$branch"
++
++case "$1" in
++  test)
++    # неверная константа в формуле MCD: тест test_known_value должен упасть
++    sed -i 's|^K = 10.0 / np.log(10.0) \* np.sqrt(2.0)|K = 10.0 / np.log(10.0)|' src/mcd.py
++    git add src/mcd.py
++    git commit -q -m "demo: ломаем формулу MCD (должен упасть тест)"
++    ;;
++  data)
++    # в копии контрольной выборки появляется NaN; эталонный хэш обновлён, чтобы сработало именно правило схемы
++    python - <<'PY'
++import numpy as np
++p = "data/control/control_val.npz"
++with np.load(p, allow_pickle=False) as f:
++    d = {k: f[k] for k in f.files}
++d["X"][0, 0] = np.nan
++np.savez_compressed(p, **d)
++PY
++    echo "$(sha256sum data/control/control_val.npz | cut -d' ' -f1)  data/control/control_val.npz" > data/control/SHA256SUMS
++    git add data/control
++    git commit -q -m "demo: NaN в контрольной выборке (должен сработать data gate)"
++    ;;
++  model)
++    # заведомо слабая константная модель; хэш модели обновлён, чтобы дошло до model gate
++    mkdir -p out
++    python src/make_weak_model.py models/gmm_M16.npz out/weak_model.npz
++    cp out/weak_model.npz models/gmm_M16.npz
++    ( cd models && sha256sum gmm_M16.npz f0_stats.json > SHA256SUMS )
++    git add models
++    git commit -q -m "demo: константная модель (должен сработать model gate)"
++    ;;
++  security)
++    # заведомо уязвимая версия urllib3 в инструментах проверки (реальная находка pip-audit)
++    sed -i 's/^urllib3==.*/urllib3==1.26.18/' requirements-dev.txt
++    git add requirements-dev.txt
++    git commit -q -m "demo: уязвимая версия urllib3 (должен сработать аудит зависимостей)"
++    ;;
++esac
++
++git push -u origin "$branch"
++echo "ветка $branch отправлена; commit: $(git rev-parse --short HEAD)"
++git switch "$start"
+diff --git a/src/align.py b/src/align.py
+index a652579..a690cfe 100644
+--- a/src/align.py
++++ b/src/align.py
+@@ -39,4 +39,4 @@ def main():
+ 
+ 
+ if __name__ == "__main__":
+-    main()
+\ No newline at end of file
++    main()
+diff --git a/src/checksums.py b/src/checksums.py
+new file mode 100644
+index 0000000..745d288
+--- /dev/null
++++ b/src/checksums.py
+@@ -0,0 +1,42 @@
++"""Работа с файлами SHA256SUMS (формат sha256sum: «хэш  путь»)."""
++import hashlib
++from pathlib import Path
++
++
++def sha256_file(path):
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        for block in iter(lambda: f.read(1 << 20), b""):
++            h.update(block)
++    return h.hexdigest()
++
++
++def read_sums(sums_path):
++    """Возвращает {путь: хэш}. Строки в неверном формате считаются ошибкой."""
++    out = {}
++    for n, line in enumerate(Path(sums_path).read_text(encoding="utf-8").splitlines(), 1):
++        if not line.strip():
++            continue
++        parts = line.split(None, 1)
++        if len(parts) != 2 or len(parts[0]) != 64:
++            raise ValueError(f"{sums_path}:{n}: неверная строка")
++        out[parts[1].strip().lstrip("*")] = parts[0].lower()
++    return out
++
++
++def verify(sums_path, base="."):
++    """Сверяет файлы из SHA256SUMS. Возвращает список нарушений (пустой - всё совпало)."""
++    problems = []
++    try:
++        sums = read_sums(sums_path)
++    except (OSError, ValueError) as exc:
++        return [f"не удалось прочитать {sums_path}: {exc}"]
++    if not sums:
++        return [f"{sums_path} пустой"]
++    for name, expected in sums.items():
++        p = Path(base) / name
++        if not p.is_file():
++            problems.append(f"{name}: файла нет")
++        elif sha256_file(p) != expected:
++            problems.append(f"{name}: SHA256 не совпадает с эталоном")
++    return problems
+diff --git a/src/data_gate.py b/src/data_gate.py
+new file mode 100644
+index 0000000..699877c
+--- /dev/null
++++ b/src/data_gate.py
+@@ -0,0 +1,97 @@
++"""Data quality gate: проверка контрольной выборки по правилам из configs/data_gate.json.
++
++Код возврата 0 - данные в порядке, 1 - нарушена хотя бы одна проверка.
++Запуск: python src/data_gate.py [--config configs/data_gate.json] [--file путь.npz]
++"""
++import argparse
++import json
++import sys
++import zipfile
++from pathlib import Path
++
++import numpy as np
++
++import checksums
++
++
++def check_arrays(cfg, data):
++    """Проверки содержимого. data - словарь массивов. Возвращает список нарушений."""
++    bad = []
++    missing = [k for k in cfg["required_arrays"] if k not in data]
++    if missing:
++        return [f"нет обязательных массивов: {missing}"]
++    x, y, utt, ids = data["X"], data["Y"], data["utt"], data["ids"]
++    for name, arr in (("X", x), ("Y", y)):
++        if arr.dtype != np.dtype(cfg["frame_dtype"]):
++            bad.append(f"{name}: тип {arr.dtype}, нужен {cfg['frame_dtype']}")
++        if arr.ndim != 2 or arr.shape[1] != cfg["n_features"]:
++            bad.append(f"{name}: форма {arr.shape}, нужно (N, {cfg['n_features']})")
++    if x.shape != y.shape:
++        bad.append(f"X и Y разной формы: {x.shape} и {y.shape}")
++    if bad:
++        return bad
++    for name, arr in (("X", x), ("Y", y)):
++        if not np.all(np.isfinite(arr)):
++            bad.append(f"{name}: есть NaN или Inf")
++        elif np.abs(arr).max() > cfg["value_abs_max"]:
++            bad.append(f"{name}: значение {np.abs(arr).max():.1f} больше допустимого {cfg['value_abs_max']}")
++    n = len(x)
++    if not cfg["min_frames"] <= n <= cfg["max_frames"]:
++        bad.append(f"число пар кадров {n} вне [{cfg['min_frames']}, {cfg['max_frames']}]")
++    if utt.ndim != 1 or len(utt) != n or not np.issubdtype(utt.dtype, np.integer):
++        bad.append("utt: нужен целочисленный вектор длиной N")
++        return bad
++    if np.any(np.diff(utt) < 0):
++        bad.append("utt: номера фраз должны идти по возрастанию")
++    counts = np.bincount(utt) if utt.min() >= 0 else np.array([])
++    n_phr = len(ids)
++    if not cfg["min_phrases"] <= n_phr <= cfg["max_phrases"]:
++        bad.append(f"число фраз {n_phr} вне [{cfg['min_phrases']}, {cfg['max_phrases']}]")
++    if len(counts) != n_phr or np.any(counts == 0):
++        bad.append("utt не соответствует списку ids")
++    elif counts.min() < cfg["min_frames_per_phrase"]:
++        bad.append(f"есть фраза с {counts.min()} кадрами, минимум {cfg['min_frames_per_phrase']}")
++    if len(set(ids.tolist())) != n_phr:
++        bad.append("в ids есть повторы")
++    return bad
++
++
++def run(cfg, file=None, root="."):
++    root = Path(root)
++    path = Path(file) if file else root / cfg["file"]
++    bad = []
++    if not path.is_file():
++        return [f"файл {path} не найден"]
++    sums = checksums.read_sums(root / cfg["checksum_file"])
++    expected = sums.get(cfg["file"])
++    if expected is None:
++        bad.append(f"в {cfg['checksum_file']} нет эталона для {cfg['file']}")
++    elif checksums.sha256_file(path) != expected:
++        bad.append("SHA256 файла не совпадает с эталоном")
++    try:
++        with np.load(path, allow_pickle=False) as f:
++            data = {k: f[k] for k in f.files}
++    except (OSError, ValueError, zipfile.BadZipFile) as exc:
++        return [*bad, f"файл не читается как npz без pickle: {exc}"]
++    return bad + check_arrays(cfg, data)
++
++
++def main(argv=None):
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--config", default="configs/data_gate.json")
++    ap.add_argument("--file", default=None, help="проверить другой файл (например, копию с ошибкой)")
++    args = ap.parse_args(argv)
++    cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
++    problems = run(cfg, args.file)
++    print(f"data gate: версия данных «{cfg['data_version']}»")
++    if problems:
++        for p in problems:
++            print("НАРУШЕНИЕ:", p)
++        print("data gate: ОТКАЗ")
++        return 1
++    print("data gate: OK")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/src/dtw.py b/src/dtw.py
+index e62f022..9eaa16a 100644
+--- a/src/dtw.py
++++ b/src/dtw.py
+@@ -33,4 +33,4 @@ def dtw_path(a, b):
+         path.append((i, j))
+     path.reverse()
+     p = np.array(path)
+-    return p[:, 0], p[:, 1], float(D[-1, -1])
+\ No newline at end of file
++    return p[:, 0], p[:, 1], float(D[-1, -1])
+diff --git a/src/evaluate.py b/src/evaluate.py
+index d233588..9da32a1 100644
+--- a/src/evaluate.py
++++ b/src/evaluate.py
+@@ -1,6 +1,12 @@
+-"""Оценка на отложенной тестовой выборке и запись metrics/baseline.json."""
++"""Однократная оценка на отложенной тестовой выборке.
++
++Запуск: python src/evaluate.py [модель] [файл результата]
++По умолчанию результат пишется в metrics/test_eval.json: файл metrics/baseline.json (эталон ЛР2)
++и metrics/ci_baseline.json (эталон CI) этим скриптом не перезаписываются.
++"""
+ import hashlib
+ import json
++import sys
+ from pathlib import Path
+ 
+ import numpy as np
+@@ -8,22 +14,28 @@ import numpy as np
+ import gmm_vc
+ from mcd import mcd
+ 
++model_path = sys.argv[1] if len(sys.argv) > 1 else "models/gmm_M16.npz"
++out_path = Path(sys.argv[2] if len(sys.argv) > 2 else "metrics/test_eval.json")
++if out_path.name in ("baseline.json", "ci_baseline.json"):
++    sys.exit("эталонные файлы не перезаписываются автоматически")
++
+ tr = np.load("data/aligned/train.npz", allow_pickle=False)
+ te = np.load("data/aligned/test.npz", allow_pickle=False)
+-model = gmm_vc.load("models/gmm_M16.npz")
++model = gmm_vc.load(model_path)
+ X, Y = te["X"], te["Y"]
++splits_sha = hashlib.sha256(Path("data/splits.json").read_bytes()).hexdigest()
+ res = {
+     "metric": "MCD (дБ, кепстр WORLD, коэф. 0 не учитывается), меньше - лучше",
+     "value_gmm": mcd(gmm_vc.convert(model, X), Y),
+     "value_copy_source": mcd(X, Y),
+     "value_mean_target": mcd(np.tile(tr["Y"].mean(0), (len(Y), 1)), Y),
+-    "n_test_phrases": int(len(te["ids"])),
+-    "n_test_frames": int(len(X)),
++    "n_test_phrases": len(te["ids"]),
++    "n_test_frames": len(X),
+     "seed": 42,
+     "n_components": 16,
+     "train_frames_used": 100000,
+-    "data_version": "CMU ARCTIC v0.95 bdl/slt; splits.json sha256=" + hashlib.sha256(Path("data/splits.json").read_bytes()).hexdigest(),
++    "data_version": "CMU ARCTIC v0.95 bdl/slt; splits.json sha256=" + splits_sha,
+ }
+-Path("metrics").mkdir(exist_ok=True)
+-Path("metrics/baseline.json").write_text(json.dumps(res, indent=1, ensure_ascii=False), encoding="utf-8")
+-print(json.dumps(res, indent=1, ensure_ascii=False))
+\ No newline at end of file
++out_path.parent.mkdir(exist_ok=True)
++out_path.write_text(json.dumps(res, indent=1, ensure_ascii=False), encoding="utf-8")
++print(json.dumps(res, indent=1, ensure_ascii=False))
+diff --git a/src/extract_features.py b/src/extract_features.py
+index cb8c2f6..a29869b 100644
+--- a/src/extract_features.py
++++ b/src/extract_features.py
+@@ -56,4 +56,4 @@ def main():
+ 
+ 
+ if __name__ == "__main__":
+-    main()
+\ No newline at end of file
++    main()
+diff --git a/src/f0_stats.py b/src/f0_stats.py
+index fc11e5d..235d98e 100644
+--- a/src/f0_stats.py
++++ b/src/f0_stats.py
+@@ -11,4 +11,4 @@ for key, spk in (("src", "bdl"), ("tgt", "slt")):
+     lf = np.log(v[v > 0].astype(np.float64))
+     out[key] = {"mean": float(lf.mean()), "std": float(lf.std())}
+ Path("models/f0_stats.json").write_text(json.dumps(out, indent=1), encoding="utf-8")
+-print(out)
+\ No newline at end of file
++print(out)
+diff --git a/src/gmm_vc.py b/src/gmm_vc.py
+index c487740..8ef925e 100644
+--- a/src/gmm_vc.py
++++ b/src/gmm_vc.py
+@@ -56,4 +56,4 @@ def save(model, path):
+ 
+ def load(path):
+     with np.load(path, allow_pickle=False) as f:
+-        return {k: f[k] for k in f.files}
+\ No newline at end of file
++        return {k: f[k] for k in f.files}
+diff --git a/src/make_control.py b/src/make_control.py
+new file mode 100644
+index 0000000..af369a7
+--- /dev/null
++++ b/src/make_control.py
+@@ -0,0 +1,36 @@
++"""Контрольная выборка для CI: 20 фраз из val (готовые выровненные пары кадров).
++
++Запускается один раз на ВМ, где есть data/aligned/val.npz. Результат лежит в Git (data/control/).
++Файл нельзя пересоздавать без обновления SHA256 и baseline: контрольная выборка должна быть неизменной.
++"""
++import json
++from pathlib import Path
++
++import numpy as np
++
++import checksums
++
++N_PHRASES = 20
++SEED = 42
++OUT = Path("data/control")
++
++va = np.load("data/aligned/val.npz", allow_pickle=False)
++ids, utt = va["ids"], va["utt"]
++pick = np.sort(np.random.default_rng(SEED).choice(len(ids), size=N_PHRASES, replace=False))
++mask = np.isin(utt, pick)
++X, Y = va["X"][mask], va["Y"][mask]
++new_utt = np.searchsorted(pick, utt[mask]).astype(np.int32)
++
++OUT.mkdir(parents=True, exist_ok=True)
++target = OUT / "control_val.npz"
++np.savez_compressed(target, X=X, Y=Y, utt=new_utt, ids=ids[pick])
++sha = checksums.sha256_file(target)
++(OUT / "SHA256SUMS").write_text(f"{sha}  data/control/control_val.npz\n", encoding="utf-8")
++splits_sha = checksums.sha256_file("data/splits.json")
++info = {
++    "phrases": N_PHRASES, "pairs_of_frames": int(len(X)), "file_bytes": target.stat().st_size,
++    "sha256": sha, "splits_sha256": splits_sha,
++    "X_min": float(X.min()), "X_max": float(X.max()), "Y_min": float(Y.min()), "Y_max": float(Y.max()),
++    "ids": [str(i) for i in ids[pick]],
++}
++print(json.dumps(info, indent=1, ensure_ascii=False))
+diff --git a/src/make_weak_model.py b/src/make_weak_model.py
+new file mode 100644
+index 0000000..1d054be
+--- /dev/null
++++ b/src/make_weak_model.py
+@@ -0,0 +1,16 @@
++"""Заведомо слабая модель для демонстрации model gate: всегда выдаёт средний вектор цели.
++
++Берёт формат модели gmm_vc, обнуляет линейные предсказания и средние цели по компонентам.
++Запуск: python src/make_weak_model.py models/gmm_M16.npz out/weak_model.npz
++"""
++import sys
++
++import numpy as np
++
++import gmm_vc
++
++model = gmm_vc.load(sys.argv[1])
++model["A"] = np.zeros_like(model["A"])
++model["muy"] = np.zeros_like(model["muy"])
++gmm_vc.save(model, sys.argv[2])
++print("записана константная модель:", sys.argv[2])
+diff --git a/src/mcd.py b/src/mcd.py
+index 5259b61..8b39efa 100644
+--- a/src/mcd.py
++++ b/src/mcd.py
+@@ -12,4 +12,4 @@ def mcd(a, b):
+     if not (np.all(np.isfinite(a)) and np.all(np.isfinite(b))):
+         raise ValueError("в данных есть NaN или Inf")
+     dist = np.sqrt(((a[:, 1:] - b[:, 1:]) ** 2).sum(axis=1))
+-    return float(K * dist.mean())
+\ No newline at end of file
++    return float(K * dist.mean())
+diff --git a/src/model_gate.py b/src/model_gate.py
+new file mode 100644
+index 0000000..d3cf15c
+--- /dev/null
++++ b/src/model_gate.py
+@@ -0,0 +1,120 @@
++"""Model quality gate: сравнение кандидатной модели с baseline на контрольной выборке.
++
++Метрика MCD (дБ), меньше - лучше. Кандидат проходит при candidate <= baseline * (1 + допуск).
++Baseline и политика лежат в metrics/ci_baseline.json и сами не перезаписываются:
++создать файл можно только командой --init-baseline, и только если его ещё нет.
++Код возврата: 0 - прошла, 1 - отказ (в том числе при плохой или несовместимой метрике).
++"""
++import argparse
++import json
++import math
++import sys
++from pathlib import Path
++
++import numpy as np
++
++import checksums
++import gmm_vc
++from mcd import mcd
++
++METRIC = "MCD (дБ, кепстр WORLD, коэф. 0 не учитывается), меньше - лучше"
++DEFAULT_TOLERANCE = 0.05
++
++
++def is_number(v):
++    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
++
++
++def compare(baseline, candidate, data_version, control_sha256):
++    """Возвращает (прошла, подробности). Все сомнительные случаи - отказ."""
++    reasons = []
++    base = baseline.get("baseline_value")
++    tol = baseline.get("relative_tolerance")
++    abs_thr = baseline.get("absolute_threshold")
++    if baseline.get("direction") != "lower_is_better":
++        reasons.append("в baseline нужно direction = lower_is_better")
++    if not is_number(candidate):
++        reasons.append(f"метрика кандидата не число: {candidate!r}")
++    if not is_number(base) or base < 0:
++        reasons.append(f"некорректное baseline_value: {base!r}")
++    if baseline.get("data_version") != data_version:
++        reasons.append("версия данных не совпадает с baseline")
++    if baseline.get("control_sha256") != control_sha256:
++        reasons.append("SHA256 контрольной выборки не совпадает с baseline")
++    threshold = None
++    if not reasons:
++        if base > 0 and is_number(tol) and tol >= 0:
++            threshold = base * (1 + tol)
++        elif is_number(abs_thr):
++            threshold = abs_thr
++        else:
++            reasons.append("нет допуска: baseline = 0 и не задан absolute_threshold, либо relative_tolerance неверен")
++    if not reasons and candidate > threshold:
++        reasons.append(f"MCD кандидата {candidate:.4f} больше порога {threshold:.4f}")
++    result = {
++        "metric": METRIC, "candidate": candidate if is_number(candidate) else None,
++        "baseline_value": base if is_number(base) else None, "threshold": threshold,
++        "passed": not reasons, "reasons": reasons,
++    }
++    return not reasons, result
++
++
++def candidate_mcd(model_path, control_path):
++    model = gmm_vc.load(model_path)
++    with np.load(control_path, allow_pickle=False) as f:
++        x, y = f["X"], f["Y"]
++    return mcd(gmm_vc.convert(model, x), y)
++
++
++def main(argv=None):
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--model", default="models/gmm_M16.npz")
++    ap.add_argument("--data-config", default="configs/data_gate.json")
++    ap.add_argument("--baseline", default="metrics/ci_baseline.json")
++    ap.add_argument("--out", default="reports/model_gate.json")
++    ap.add_argument("--init-baseline", action="store_true", help="создать baseline по текущей модели (один раз)")
++    args = ap.parse_args(argv)
++
++    cfg = json.loads(Path(args.data_config).read_text(encoding="utf-8"))
++    control = Path(cfg["file"])
++    control_sha = checksums.sha256_file(control)
++    model_sha = checksums.sha256_file(args.model)
++
++    if args.init_baseline:
++        base_path = Path(args.baseline)
++        if base_path.exists():
++            print(f"{base_path} уже есть, baseline автоматически не перезаписывается")
++            return 1
++        value = candidate_mcd(args.model, control)
++        baseline = {
++            "metric": METRIC, "direction": "lower_is_better", "baseline_value": value,
++            "relative_tolerance": DEFAULT_TOLERANCE, "absolute_threshold": None,
++            "data_version": cfg["data_version"], "control_sha256": control_sha, "model_sha256": model_sha,
++        }
++        base_path.write_text(json.dumps(baseline, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
++        print(f"baseline записан: MCD {value:.4f} дБ")
++        return 0
++
++    baseline = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
++    try:
++        cand = candidate_mcd(args.model, control)
++    except (OSError, ValueError, KeyError) as exc:
++        cand = None
++        load_error = f"не удалось оценить модель: {exc}"
++    else:
++        load_error = None
++    ok, result = compare(baseline, cand, cfg["data_version"], control_sha)
++    if load_error:
++        result["reasons"].append(load_error)
++        ok = result["passed"] = False
++    result.update(model=args.model, model_sha256=model_sha, control_sha256=control_sha,
++                  data_version=cfg["data_version"], exit_code=0 if ok else 1)
++    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
++    Path(args.out).write_text(json.dumps(result, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
++    print(json.dumps(result, indent=1, ensure_ascii=False))
++    print("model gate:", "OK" if ok else "ОТКАЗ")
++    return result["exit_code"]
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/src/predict.py b/src/predict.py
+index 1432ea5..573216e 100644
+--- a/src/predict.py
++++ b/src/predict.py
+@@ -12,8 +12,9 @@ FS = 16000
+ N_MC = 24
+ MAX_SECONDS = 10.0
+ MAX_BYTES = 1_000_000
+-MODEL_PATH = Path("models/gmm_M16.npz")
+-STATS_PATH = Path("models/f0_stats.json")
++ROOT = Path(__file__).resolve().parent.parent
++MODEL_PATH = ROOT / "models" / "gmm_M16.npz"
++STATS_PATH = ROOT / "models" / "f0_stats.json"
+ 
+ 
+ class InputError(ValueError):
+@@ -81,4 +82,4 @@ def predict(path, model=None, stats=None):
+ 
+ if __name__ == "__main__":
+     import sys
+-    sf.write(sys.argv[2], predict(sys.argv[1]), FS, subtype="PCM_16")
+\ No newline at end of file
++    sf.write(sys.argv[2], predict(sys.argv[1]), FS, subtype="PCM_16")
+diff --git a/src/robustness.py b/src/robustness.py
+index f8e157a..053102a 100644
+--- a/src/robustness.py
++++ b/src/robustness.py
+@@ -36,6 +36,7 @@ for k, v in res.items():
+ for name, z in (("белый шум 3 с", rng.uniform(-0.3, 0.3, 3 * FS)), ("тишина 2 с", np.zeros(2 * FS))):
+     try:
+         y, _ = conv_mc(z)
+-        print(f"{name}: выход {len(y) / FS:.2f} с, пик {np.abs(y).max():.3f}, конечные значения: {bool(np.all(np.isfinite(y)))}")
++        finite = bool(np.all(np.isfinite(y)))
++        print(f"{name}: выход {len(y) / FS:.2f} с, пик {np.abs(y).max():.3f}, конечные значения: {finite}")
+     except Exception as exc:
+-        print(f"{name}: ошибка {type(exc).__name__}: {exc}")
+\ No newline at end of file
++        print(f"{name}: ошибка {type(exc).__name__}: {exc}")
+diff --git a/src/security_gate.py b/src/security_gate.py
+new file mode 100644
+index 0000000..60336f8
+--- /dev/null
++++ b/src/security_gate.py
+@@ -0,0 +1,119 @@
++"""Security gate: проверка отчётов pip-audit и Trivy по политике configs/security_policy.json.
++
++Политика pip-audit строгая: отказ при любой находке, кроме перечисленных в allow (с причиной).
++Политика Trivy: отказ при находках с severity из block_severities (по умолчанию CRITICAL и UNKNOWN).
++Пустой, повреждённый или отсутствующий отчёт и ошибка самого сканера - отказ, а не «уязвимостей нет».
++
++Запуск:
++  python src/security_gate.py pip-audit reports/pip-audit.json --tool-exit-code $rc \\
++      --requirements requirements-runtime.txt requirements-dev.txt
++  python src/security_gate.py trivy reports/trivy-image.json
++"""
++import argparse
++import json
++import re
++import sys
++from pathlib import Path
++
++
++def load_report(path):
++    try:
++        return json.loads(Path(path).read_text(encoding="utf-8")), None
++    except (OSError, ValueError) as exc:
++        return None, f"отчёт не прочитан: {exc}"
++
++
++def norm(name):
++    return re.sub(r"[-_.]+", "-", name).lower()
++
++
++def pinned_names(req_files):
++    """Имена пакетов из requirements-файлов (строки вида имя==версия; -r и комментарии пропускаются)."""
++    names = set()
++    for f in req_files:
++        for line in Path(f).read_text(encoding="utf-8").splitlines():
++            line = line.split("#")[0].strip()
++            if line and not line.startswith("-"):
++                names.add(norm(re.split(r"[=<>!~\[; ]", line, maxsplit=1)[0]))
++    return names
++
++
++def allowed_ids(entries):
++    return {e["id"] for e in entries}
++
++
++def check_pip_audit(report, policy):
++    """Возвращает список блокирующих находок (строки) и список допущенных."""
++    deps = report.get("dependencies") if isinstance(report, dict) else None
++    if not isinstance(deps, list) or not deps:
++        return ["в отчёте pip-audit нет списка зависимостей"], []
++    allow = allowed_ids(policy["pip_audit"]["allow"])
++    blocking, accepted = [], []
++    for d in deps:
++        name, ver = d.get("name"), d.get("version")
++        if d.get("skip_reason"):
++            blocking.append(f"{name} {ver}: пакет пропущен ({d['skip_reason']})")
++        for v in d.get("vulns", []):
++            ids = {v.get("id"), *v.get("aliases", [])}
++            line = f"{name} {ver}: {v.get('id')} (исправление: {', '.join(v.get('fix_versions', [])) or 'нет'})"
++            (accepted if ids & allow else blocking).append(line)
++    return blocking, accepted
++
++
++def check_trivy(report, policy):
++    if not isinstance(report, dict) or "ArtifactName" not in report:
++        return ["это не отчёт Trivy"], []
++    results = report.get("Results")
++    if not isinstance(results, list) or not results:
++        return ["в отчёте Trivy нет результатов сканирования"], []
++    cfg = policy["trivy"]
++    block, allow = {s.upper() for s in cfg["block_severities"]}, allowed_ids(cfg["allow"])
++    blocking, accepted = [], []
++    for r in results:
++        for v in r.get("Vulnerabilities") or []:
++            sev = str(v.get("Severity", "UNKNOWN")).upper()
++            line = (f"{r.get('Target')}: {v.get('PkgName')} {v.get('InstalledVersion')} "
++                    f"{v.get('VulnerabilityID')} [{sev}] исправление: {v.get('FixedVersion') or 'нет'}")
++            if sev not in block:
++                continue
++            (accepted if v.get("VulnerabilityID") in allow else blocking).append(line)
++    return blocking, accepted
++
++
++def main(argv=None):
++    ap = argparse.ArgumentParser()
++    ap.add_argument("kind", choices=["pip-audit", "trivy"])
++    ap.add_argument("report")
++    ap.add_argument("--policy", default="configs/security_policy.json")
++    ap.add_argument("--requirements", nargs="+", default=[],
++                    help="requirements-файлы: каждый их пакет должен быть в отчёте pip-audit (иначе он не проверен)")
++    ap.add_argument("--tool-exit-code", type=int, default=None,
++                    help="код возврата сканера; для pip-audit допустимы 0 и 1 (1 - есть находки)")
++    args = ap.parse_args(argv)
++    policy = json.loads(Path(args.policy).read_text(encoding="utf-8"))
++
++    problems = []
++    ok_codes = (0, 1) if args.kind == "pip-audit" else (0,)
++    if args.tool_exit_code is not None and args.tool_exit_code not in ok_codes:
++        problems.append(f"сканер завершился с ошибкой (код {args.tool_exit_code})")
++    report, err = load_report(args.report)
++    if err:
++        problems.append(err)
++    else:
++        check = check_pip_audit if args.kind == "pip-audit" else check_trivy
++        blocking, accepted = check(report, policy)
++        if args.kind == "pip-audit" and args.requirements:
++            audited = {norm(d.get("name", "")) for d in report.get("dependencies", [])}
++            blocking += [f"{n}: пакет есть в requirements, но не проверен pip-audit"
++                         for n in sorted(pinned_names(args.requirements) - audited)]
++        problems += blocking
++        for a in accepted:
++            print("допущено по политике:", a)
++    for p in problems:
++        print("БЛОКИРУЕТ:", p)
++    print(f"security gate ({args.kind}):", "ОТКАЗ" if problems else "OK")
++    return 1 if problems else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/src/smoke.py b/src/smoke.py
+new file mode 100644
+index 0000000..459fb26
+--- /dev/null
++++ b/src/smoke.py
+@@ -0,0 +1,34 @@
++"""Smoke-проверка: хэши модели, загрузка модели, предсказание для синтетического WAV.
++
++Запуск из любого каталога: python src/smoke.py. Код возврата 0 - всё в порядке.
++"""
++import sys
++import tempfile
++from pathlib import Path
++
++import numpy as np
++import soundfile as sf
++
++import checksums
++import predict
++
++
++def main():
++    problems = checksums.verify(predict.ROOT / "models" / "SHA256SUMS", predict.ROOT)
++    if problems:
++        print("smoke: ОТКАЗ, целостность модели:", "; ".join(problems))
++        return 1
++    t = np.arange(predict.FS) / predict.FS
++    with tempfile.TemporaryDirectory() as d:
++        wav = Path(d) / "smoke.wav"
++        sf.write(str(wav), 0.3 * np.sin(2 * np.pi * 200 * t), predict.FS, subtype="PCM_16")
++        y = predict.predict(wav)
++    if y.dtype != np.int16 or abs(len(y) - predict.FS) > 1000:
++        print(f"smoke: ОТКАЗ, неожиданный выход: {y.dtype}, длина {len(y)}")
++        return 1
++    print(f"smoke: OK, хэши совпали, выход int16, {len(y)} отсчётов")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/src/train_gmm.py b/src/train_gmm.py
+index 1a9f4b0..b7bda81 100644
+--- a/src/train_gmm.py
++++ b/src/train_gmm.py
+@@ -33,4 +33,4 @@ def main():
+ 
+ 
+ if __name__ == "__main__":
+-    main()
+\ No newline at end of file
++    main()
+diff --git a/tests/test_checksums.py b/tests/test_checksums.py
+new file mode 100644
+index 0000000..bb7aaf2
+--- /dev/null
++++ b/tests/test_checksums.py
+@@ -0,0 +1,24 @@
++import checksums
++
++
++def test_sha256_known_value(tmp_path):
++    p = tmp_path / "a.txt"
++    p.write_bytes(b"abc")
++    assert checksums.sha256_file(p) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
++
++
++def test_verify_ok_and_changed(tmp_path):
++    p = tmp_path / "a.txt"
++    p.write_bytes(b"abc")
++    sums = tmp_path / "SHA256SUMS"
++    sums.write_text("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  a.txt\n")
++    assert checksums.verify(sums, tmp_path) == []
++    p.write_bytes(b"abd")
++    assert checksums.verify(sums, tmp_path) == ["a.txt: SHA256 не совпадает с эталоном"]
++
++
++def test_verify_bad_sums_file(tmp_path):
++    sums = tmp_path / "SHA256SUMS"
++    sums.write_text("not a hash line\n")
++    assert checksums.verify(sums, tmp_path)
++    assert checksums.verify(tmp_path / "nope", tmp_path)
+diff --git a/tests/test_data_gate.py b/tests/test_data_gate.py
+new file mode 100644
+index 0000000..94cb129
+--- /dev/null
++++ b/tests/test_data_gate.py
+@@ -0,0 +1,95 @@
++import json
++import shutil
++from pathlib import Path
++
++import numpy as np
++import pytest
++
++import checksums
++import data_gate
++
++CFG = {
++    "data_version": "test", "file": "control.npz", "checksum_file": "SHA256SUMS",
++    "required_arrays": ["X", "Y", "utt", "ids"], "frame_dtype": "float32", "n_features": 24,
++    "min_phrases": 2, "max_phrases": 5, "min_frames": 100, "max_frames": 1000,
++    "min_frames_per_phrase": 20, "value_abs_max": 100.0,
++}
++
++
++def make(tmp_path, **override):
++    rng = np.random.default_rng(1)
++    d = {
++        "X": rng.normal(size=(200, 24)).astype(np.float32),
++        "Y": rng.normal(size=(200, 24)).astype(np.float32),
++        "utt": np.repeat(np.arange(4), 50).astype(np.int32),
++        "ids": np.array(["a", "b", "c", "d"]),
++    }
++    d.update(override)
++    p = tmp_path / "control.npz"
++    np.savez(p, **d)
++    (tmp_path / "SHA256SUMS").write_text(f"{checksums.sha256_file(p)}  control.npz\n")
++    (tmp_path / "cfg.json").write_text(json.dumps(CFG))
++    return p
++
++
++def test_good_data_passes(tmp_path):
++    make(tmp_path)
++    assert data_gate.run(CFG, root=tmp_path) == []
++
++
++def test_changed_file_fails_hash(tmp_path):
++    p = make(tmp_path)
++    copy = tmp_path / "copy.npz"
++    shutil.copy(p, copy)
++    with np.load(p) as f:
++        d = {k: f[k] for k in f.files}
++    d["X"][0, 0] += 1
++    np.savez(copy, **d)
++    assert any("SHA256" in x for x in data_gate.run(CFG, file=copy, root=tmp_path))
++
++
++@pytest.mark.parametrize("override, word", [
++    ({"X": np.full((200, 24), np.nan, dtype=np.float32)}, "NaN"),
++    ({"X": np.full((200, 24), 1e6, dtype=np.float32)}, "больше допустимого"),
++    ({"X": np.zeros((200, 23), dtype=np.float32), "Y": np.zeros((200, 23), dtype=np.float32)}, "форма"),
++    ({"X": np.zeros((200, 24), dtype=np.float64)}, "тип"),
++    ({"Y": np.zeros((199, 24), dtype=np.float32)}, "разной формы"),
++    ({"utt": np.repeat(np.arange(4)[::-1], 50).astype(np.int32)}, "по возрастанию"),
++    ({"ids": np.array(["a", "b", "c"])}, "ids"),
++    ({"ids": np.array(["a", "a", "b", "c"])}, "повторы"),
++])
++def test_violations_detected(tmp_path, override, word):
++    make(tmp_path, **override)
++    assert any(word in x for x in data_gate.run(CFG, root=tmp_path))
++
++
++def test_missing_array(tmp_path):
++    p = make(tmp_path)
++    with np.load(p) as f:
++        np.savez(p, X=f["X"], Y=f["Y"])
++    assert any("обязательных" in x for x in data_gate.run(CFG, root=tmp_path))
++
++
++def test_pickle_file_rejected(tmp_path):
++    p = make(tmp_path)
++    np.savez(p, X=np.array([object()], dtype=object))
++    assert any("не читается" in x for x in data_gate.run(CFG, root=tmp_path))
++
++
++def test_missing_file(tmp_path):
++    (tmp_path / "SHA256SUMS").write_text("")
++    assert data_gate.run(CFG, root=tmp_path)
++
++
++def test_cli_exit_codes(tmp_path, monkeypatch):
++    make(tmp_path)
++    monkeypatch.chdir(tmp_path)
++    assert data_gate.main(["--config", "cfg.json"]) == 0
++    bad = Path("bad.npz")
++    np.savez(bad, X=np.zeros((3, 24), dtype=np.float32))
++    assert data_gate.main(["--config", "cfg.json", "--file", str(bad)]) == 1
++
++
++def test_real_config_is_consistent():
++    cfg = json.loads((Path(__file__).parent.parent / "configs" / "data_gate.json").read_text(encoding="utf-8"))
++    assert cfg["min_frames"] < cfg["max_frames"] and cfg["min_phrases"] < cfg["max_phrases"]
+diff --git a/tests/test_dtw.py b/tests/test_dtw.py
+index be5ad1b..c0d2d02 100644
+--- a/tests/test_dtw.py
++++ b/tests/test_dtw.py
+@@ -1,4 +1,5 @@
+ import numpy as np
++
+ from dtw import dtw_path
+ 
+ 
+@@ -39,4 +40,4 @@ def test_path_is_valid():
+ def test_identical_sequences_zero_cost():
+     a = np.random.default_rng(2).normal(size=(10, 3))
+     i, j, cost = dtw_path(a, a)
+-    assert cost == 0 and np.array_equal(i, j)
+\ No newline at end of file
++    assert cost == 0 and np.array_equal(i, j)
+diff --git a/tests/test_gmm_vc.py b/tests/test_gmm_vc.py
+new file mode 100644
+index 0000000..aa8dc9a
+--- /dev/null
++++ b/tests/test_gmm_vc.py
+@@ -0,0 +1,41 @@
++import numpy as np
++import pytest
++
++import gmm_vc
++from mcd import mcd
++
++
++@pytest.fixture(scope="module")
++def toy():
++    """Синтетические пары кадров: Y = 0.5 * X + 1 с небольшим шумом (фиксированный seed)."""
++    rng = np.random.default_rng(0)
++    x = rng.normal(size=(3000, 24))
++    y = 0.5 * x + 1.0 + rng.normal(scale=0.05, size=x.shape)
++    model, converged, _ = gmm_vc.fit(x[:2500], y[:2500], n_components=2, seed=42)
++    return model, converged, x[2500:], y[2500:]
++
++
++def test_convert_shape_and_finite(toy):
++    model, _, x, _ = toy
++    out = gmm_vc.convert(model, x)
++    assert out.shape == x.shape
++    assert np.all(np.isfinite(out))
++
++
++def test_model_beats_copy_on_known_mapping(toy):
++    model, _, x, y = toy
++    assert mcd(gmm_vc.convert(model, x), y) < 0.3 * mcd(x, y)
++
++
++def test_save_load_roundtrip(toy, tmp_path):
++    model, _, x, _ = toy
++    gmm_vc.save(model, tmp_path / "m.npz")
++    loaded = gmm_vc.load(tmp_path / "m.npz")
++    assert np.allclose(gmm_vc.convert(model, x), gmm_vc.convert(loaded, x))
++
++
++def test_load_rejects_pickle(tmp_path):
++    p = tmp_path / "evil.npz"
++    np.savez(p, a=np.array([object()], dtype=object))
++    with pytest.raises(ValueError):
++        gmm_vc.load(p)
+diff --git a/tests/test_mcd.py b/tests/test_mcd.py
+index a49bcc8..643bdb1 100644
+--- a/tests/test_mcd.py
++++ b/tests/test_mcd.py
+@@ -21,4 +21,4 @@ def test_rejects_bad_input():
+     with pytest.raises(ValueError):
+         mcd(np.zeros((2, 24)), np.zeros((3, 24)))
+     with pytest.raises(ValueError):
+-        mcd(np.full((1, 24), np.nan), np.zeros((1, 24)))
+\ No newline at end of file
++        mcd(np.full((1, 24), np.nan), np.zeros((1, 24)))
+diff --git a/tests/test_model_gate.py b/tests/test_model_gate.py
+new file mode 100644
+index 0000000..ea30bcb
+--- /dev/null
++++ b/tests/test_model_gate.py
+@@ -0,0 +1,103 @@
++import json
++import math
++
++import numpy as np
++import pytest
++
++import gmm_vc
++import model_gate
++
++BASE = {
++    "direction": "lower_is_better", "baseline_value": 7.6, "relative_tolerance": 0.05,
++    "absolute_threshold": None, "data_version": "v1", "control_sha256": "abc",
++}
++
++
++def gate(candidate, **override):
++    return model_gate.compare({**BASE, **override}, candidate, "v1", "abc")
++
++
++def test_threshold_is_five_percent_above_baseline():
++    ok, res = gate(7.6)
++    assert ok and res["threshold"] == pytest.approx(7.98)
++
++
++def test_boundary_and_above():
++    assert gate(7.97)[0]
++    assert not gate(7.99)[0]
++    assert not gate(14.0)[0]
++
++
++@pytest.mark.parametrize("bad", [None, "7.0", float("nan"), math.inf, True])
++def test_bad_candidate_rejected(bad):
++    assert not gate(bad)[0]
++
++
++def test_incompatible_data_rejected():
++    assert not model_gate.compare(BASE, 7.0, "other", "abc")[0]
++    assert not model_gate.compare(BASE, 7.0, "v1", "other")[0]
++
++
++def test_bad_baseline_rejected():
++    assert not gate(7.0, baseline_value=None)[0]
++    assert not gate(7.0, baseline_value=float("nan"))[0]
++    assert not gate(7.0, direction="higher_is_better")[0]
++
++
++def test_zero_baseline_needs_absolute_threshold():
++    assert not gate(0.1, baseline_value=0.0)[0]
++    assert gate(0.1, baseline_value=0.0, absolute_threshold=0.5)[0]
++    assert not gate(0.6, baseline_value=0.0, absolute_threshold=0.5)[0]
++
++
++def test_real_baseline_file_is_well_formed():
++    from pathlib import Path
++    p = Path(__file__).parent.parent / "metrics" / "ci_baseline.json"
++    if p.exists():
++        b = json.loads(p.read_text(encoding="utf-8"))
++        assert b["relative_tolerance"] == 0.05 and b["direction"] == "lower_is_better"
++
++
++@pytest.fixture
++def workspace(tmp_path, monkeypatch):
++    """Маленькая контрольная выборка и две модели: рабочая и константная."""
++    import checksums
++    rng = np.random.default_rng(0)
++    x = rng.normal(size=(600, 24))
++    y = 0.5 * x + 1.0
++    good, _, _ = gmm_vc.fit(x, y, 2, 42)
++    weak = {**good, "A": np.zeros_like(good["A"]), "muy": np.zeros_like(good["muy"])}
++    gmm_vc.save(good, tmp_path / "good.npz")
++    gmm_vc.save(weak, tmp_path / "weak.npz")
++    np.savez(tmp_path / "control.npz", X=x.astype(np.float32), Y=y.astype(np.float32))
++    cfg = {"file": "control.npz", "data_version": "toy"}
++    (tmp_path / "cfg.json").write_text(json.dumps(cfg))
++    monkeypatch.chdir(tmp_path)
++    assert checksums.sha256_file("control.npz")
++    return tmp_path
++
++
++def run(args):
++    return model_gate.main(["--data-config", "cfg.json", "--baseline", "base.json", "--out", "out/r.json", *args])
++
++
++def test_init_baseline_then_gate_passes_and_weak_model_fails(workspace):
++    assert run(["--model", "good.npz", "--init-baseline"]) == 0
++    assert run(["--model", "good.npz"]) == 0
++    assert json.loads((workspace / "out/r.json").read_text())["exit_code"] == 0
++    assert run(["--model", "weak.npz"]) == 1
++    res = json.loads((workspace / "out/r.json").read_text())
++    assert res["exit_code"] == 1 and res["candidate"] > res["threshold"]
++
++
++def test_baseline_is_not_overwritten(workspace):
++    assert run(["--model", "good.npz", "--init-baseline"]) == 0
++    before = (workspace / "base.json").read_text()
++    assert run(["--model", "weak.npz", "--init-baseline"]) == 1
++    assert (workspace / "base.json").read_text() == before
++
++
++def test_broken_model_file_rejected(workspace):
++    assert run(["--model", "good.npz", "--init-baseline"]) == 0
++    (workspace / "broken.npz").write_bytes(b"not a model")
++    assert run(["--model", "broken.npz"]) == 1
+diff --git a/tests/test_predict.py b/tests/test_predict.py
+index 1bfb58a..803f866 100644
+--- a/tests/test_predict.py
++++ b/tests/test_predict.py
+@@ -57,4 +57,36 @@ def test_valid_input():
+     with tempfile.TemporaryDirectory() as d:
+         y = predict.predict(wav(Path(d) / "a.wav", seconds=1.0))
+     assert y.dtype == np.int16 and len(y) > 0
+-    assert abs(len(y) - 16000) < 1000
+\ No newline at end of file
++    assert abs(len(y) - 16000) < 1000
++
++
++def test_file_not_found(tmp_path, no_model):
++    with pytest.raises(predict.InputError):
++        predict.predict(tmp_path / "missing.wav", model={}, stats={})
++
++
++def test_file_too_big(tmp_path, no_model, monkeypatch):
++    monkeypatch.setattr(predict, "MAX_BYTES", 1000)
++    with pytest.raises(predict.InputError):
++        predict.predict(wav(tmp_path / "a.wav", seconds=1.0), model={}, stats={})
++
++
++def test_float_wav_rejected(tmp_path, no_model):
++    with pytest.raises(predict.InputError):
++        predict.predict(wav(tmp_path / "a.wav", subtype="FLOAT"), model={}, stats={})
++
++
++def test_nan_in_signal_rejected(tmp_path, no_model, monkeypatch):
++    p = wav(tmp_path / "a.wav")
++    monkeypatch.setattr(predict.sf, "read", lambda *a, **k: (np.full(16000, np.nan), 16000))
++    with pytest.raises(predict.InputError):
++        predict.predict(p, model={}, stats={})
++
++
++def test_convert_audio_output_properties():
++    model, stats = predict.load_artifacts()
++    t = np.arange(16000) / 16000
++    y = predict.convert_audio(0.3 * np.sin(2 * np.pi * 200 * t), model, stats)
++    assert np.all(np.isfinite(y))
++    assert np.abs(y).max() <= 0.99
++    assert abs(len(y) - 16000) < 1000
+diff --git a/tests/test_security_gate.py b/tests/test_security_gate.py
+new file mode 100644
+index 0000000..f8e7203
+--- /dev/null
++++ b/tests/test_security_gate.py
+@@ -0,0 +1,107 @@
++import json
++from pathlib import Path
++
++import security_gate
++
++POLICY = {
++    "pip_audit": {"allow": [{"id": "PYSEC-1", "reason": "тест"}]},
++    "trivy": {"block_severities": ["CRITICAL", "UNKNOWN"], "allow": []},
++}
++
++
++def dep(name, vulns=(), **extra):
++    return {"name": name, "version": "1.0", "vulns": list(vulns), **extra}
++
++
++def vuln(vid, aliases=()):
++    return {"id": vid, "aliases": list(aliases), "fix_versions": ["2.0"]}
++
++
++def test_pip_audit_clean_and_allowed_pass():
++    report = {"dependencies": [dep("a"), dep("b", [vuln("PYSEC-1")])]}
++    blocking, accepted = security_gate.check_pip_audit(report, POLICY)
++    assert blocking == [] and len(accepted) == 1
++
++
++def test_pip_audit_new_finding_blocks_even_if_severity_unknown():
++    blocking, _ = security_gate.check_pip_audit({"dependencies": [dep("a", [vuln("PYSEC-9")])]}, POLICY)
++    assert len(blocking) == 1
++
++
++def test_pip_audit_alias_of_allowed_id_is_accepted():
++    blocking, _ = security_gate.check_pip_audit({"dependencies": [dep("a", [vuln("GHSA-x", ["PYSEC-1"])])]}, POLICY)
++    assert blocking == []
++
++
++def test_pip_audit_skipped_package_and_empty_report_block():
++    assert security_gate.check_pip_audit({"dependencies": [dep("a", skip_reason="not found")]}, POLICY)[0]
++    assert security_gate.check_pip_audit({"dependencies": []}, POLICY)[0]
++    assert security_gate.check_pip_audit({}, POLICY)[0]
++
++
++def trivy(*vulns):
++    return {"ArtifactName": "img", "Results": [{"Target": "os", "Vulnerabilities": list(vulns)}]}
++
++
++def tv(vid, sev):
++    return {"VulnerabilityID": vid, "PkgName": "p", "InstalledVersion": "1", "Severity": sev}
++
++
++def test_trivy_blocks_critical_and_unknown_not_low():
++    report = trivy(tv("CVE-1", "CRITICAL"), tv("CVE-2", "UNKNOWN"), tv("CVE-3", "LOW"))
++    blocking, _ = security_gate.check_trivy(report, POLICY)
++    assert len(blocking) == 2
++
++
++def test_trivy_clean_ok_but_empty_or_foreign_report_blocks():
++    assert security_gate.check_trivy({"ArtifactName": "i", "Results": [{"Target": "os"}]}, POLICY) == ([], [])
++    assert security_gate.check_trivy({"ArtifactName": "i"}, POLICY)[0]
++    assert security_gate.check_trivy({"x": 1}, POLICY)[0]
++
++
++def run(tmp_path, kind, report, **kw):
++    pol = tmp_path / "p.json"
++    pol.write_text(json.dumps(POLICY))
++    rep = tmp_path / "r.json"
++    if report is not None:
++        rep.write_text(report if isinstance(report, str) else json.dumps(report))
++    args = [kind, str(rep), "--policy", str(pol)]
++    if "code" in kw:
++        args += ["--tool-exit-code", str(kw["code"])]
++    return security_gate.main(args)
++
++
++def test_cli_simulated_critical_report_fails(tmp_path):
++    """Имитация: тестовый отчёт Trivy с критичной находкой должен остановить gate."""
++    assert run(tmp_path, "trivy", trivy(tv("CVE-FAKE-0001", "CRITICAL"))) == 1
++
++
++def test_cli_ok_and_tool_errors(tmp_path):
++    assert run(tmp_path, "pip-audit", {"dependencies": [dep("a")]}, code=0) == 0
++    assert run(tmp_path, "pip-audit", {"dependencies": [dep("a")]}, code=2) == 1
++    assert run(tmp_path, "pip-audit", "not json") == 1
++    (tmp_path / "r.json").unlink()
++    assert run(tmp_path, "pip-audit", None) == 1
++
++
++def test_real_policy_allows_only_documented_setuptools_ids():
++    p = Path(__file__).parent.parent / "configs" / "security_policy.json"
++    pol = json.loads(p.read_text(encoding="utf-8"))
++    assert {e["id"] for e in pol["pip_audit"]["allow"]} == {"PYSEC-2026-3447", "GHSA-xmj3-9gf7-h52w"}
++    assert all(e["reason"] for e in pol["pip_audit"]["allow"])
++
++
++def test_package_missing_from_report_blocks(tmp_path):
++    req = tmp_path / "req.txt"
++    req.write_text("# comment\n-r other.txt\nnumpy==2.5.4\nboolean.py==5.0\nTyping_Extensions==4.16.0\n")
++    assert security_gate.pinned_names([req]) == {"numpy", "boolean-py", "typing-extensions"}
++    report = {"dependencies": [dep("numpy"), dep("boolean.py")]}
++    rep = tmp_path / "r.json"
++    rep.write_text(json.dumps(report))
++    pol = tmp_path / "p.json"
++    pol.write_text(json.dumps(POLICY))
++    args = ["pip-audit", str(rep), "--policy", str(pol), "--tool-exit-code", "0", "--requirements", str(req)]
++    assert security_gate.main(args) == 1
++    report["dependencies"].append(dep("typing_extensions"))
++    rep.write_text(json.dumps(report))
++    assert security_gate.main(args) == 0

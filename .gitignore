@@ -10,3 +10,4 @@ data/aligned/
 *.log
 out/
 jupyter.out
+reports/

@@ -1,0 +1,14 @@
+{
+ "data_version": "CMU ARCTIC v0.95 bdl/slt; control sample from val of data/splits.json sha256=6a47f85e3a7db4f9e511d4cac221993d05b747c301bcf0239bfacbba81349fe2",
+ "file": "data/control/control_val.npz",
+ "checksum_file": "data/control/SHA256SUMS",
+ "required_arrays": ["X", "Y", "utt", "ids"],
+ "frame_dtype": "float32",
+ "n_features": 24,
+ "min_phrases": 15,
+ "max_phrases": 25,
+ "min_frames": 5000,
+ "max_frames": 50000,
+ "min_frames_per_phrase": 50,
+ "value_abs_max": 100.0
+}

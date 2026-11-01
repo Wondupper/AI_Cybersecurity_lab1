@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# минимальные права: только чтение кода; секреты не используются
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.14.4"
+
+jobs:
+  # 1. код: линтер, Bandit, тесты, аудит зависимостей
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-*.txt
+      - name: Установка зависимостей
+        run: python -m pip install -r requirements-dev.txt
+      - name: Версии инструментов
+        run: |
+          mkdir -p reports
+          { python --version; ruff --version; python -m bandit --version | head -1; python -m pytest --version; python -m pip_audit --version; } | tee reports/tool-versions.txt
+      - name: Ruff
+        run: ruff check src/ tests/
+      - name: Bandit
+        run: |
+          rc=0
+          python -m bandit -r src/ -f txt -o reports/bandit.txt || rc=$?
+          cat reports/bandit.txt
+          exit "$rc"
+      - name: Тесты
+        run: python -m pytest tests/ -q --junitxml=reports/pytest.xml
+      - name: Аудит зависимостей
+        run: |
+          # код возврата pip-audit не скрывается: он передаётся в gate, который проверяет и отчёт
+          rc=0
+          python -m pip_audit --no-deps --disable-pip -r requirements-runtime.txt -r requirements-dev.txt -f json -o reports/pip-audit.json || rc=$?
+          echo "pip-audit exit code: $rc"
+          python src/security_gate.py pip-audit reports/pip-audit.json --tool-exit-code "$rc" --requirements requirements-runtime.txt requirements-dev.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: reports-quality
+          path: reports/
+          if-no-files-found: warn
+
+  # 2. данные и модель: целостность, data gate, model gate
+  gates:
+    needs: quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-*.txt
+      - name: Установка зависимостей
+        run: python -m pip install -r requirements-dev.txt
+      - name: Целостность модели и контрольной выборки
+        run: |
+          mkdir -p reports
+          sha256sum -c models/SHA256SUMS
+          sha256sum -c data/control/SHA256SUMS
+          { echo "commit: $GITHUB_SHA"; echo "ref: $GITHUB_REF"; sha256sum models/gmm_M16.npz models/f0_stats.json data/control/control_val.npz; } | tee reports/run-info.txt
+      - name: Data quality gate
+        run: python src/data_gate.py
+      - name: Model quality gate
+        run: python src/model_gate.py --out reports/model_gate.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: reports-gates
+          path: reports/
+          if-no-files-found: warn
+
+  # 3. образ: сборка, запуск без root, smoke, сканирование
+  image:
+    needs: gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Сборка образа
+        run: docker build -t ml-project:lab3 .
+      - name: Образ работает без root
+        run: |
+          mkdir -p reports
+          uid=$(docker run --rm --entrypoint id ml-project:lab3 -u)
+          echo "uid в контейнере: $uid" | tee reports/container-user.txt
+          test "$uid" != "0"
+      - name: Smoke-проверка модели в контейнере
+        run: |
+          docker run --rm --network none --read-only --tmpfs /tmp --cap-drop ALL \
+            --security-opt no-new-privileges ml-project:lab3 | tee reports/smoke.txt
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: v0.76.1
+          cache: true
+      - name: Trivy, проверка Dockerfile
+        run: |
+          trivy --version | tee reports/trivy-version.txt
+          trivy config --exit-code 1 --format json --output reports/trivy-config.json Dockerfile
+      - name: Trivy, сканирование образа
+        run: |
+          trivy image --format json --output reports/trivy-image.json ml-project:lab3
+          trivy image --severity CRITICAL --exit-code 1 ml-project:lab3
+          python src/security_gate.py trivy reports/trivy-image.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: reports-image
+          path: reports/
+          if-no-files-found: warn

@@ -36,6 +36,7 @@ for k, v in res.items():
 for name, z in (("белый шум 3 с", rng.uniform(-0.3, 0.3, 3 * FS)), ("тишина 2 с", np.zeros(2 * FS))):
     try:
         y, _ = conv_mc(z)
-        print(f"{name}: выход {len(y) / FS:.2f} с, пик {np.abs(y).max():.3f}, конечные значения: {bool(np.all(np.isfinite(y)))}")
+        finite = bool(np.all(np.isfinite(y)))
+        print(f"{name}: выход {len(y) / FS:.2f} с, пик {np.abs(y).max():.3f}, конечные значения: {finite}")
     except Exception as exc:
         print(f"{name}: ошибка {type(exc).__name__}: {exc}")

@@ -12,8 +12,9 @@ FS = 16000
 N_MC = 24
 MAX_SECONDS = 10.0
 MAX_BYTES = 1_000_000
-MODEL_PATH = Path("models/gmm_M16.npz")
-STATS_PATH = Path("models/f0_stats.json")
+ROOT = Path(__file__).resolve().parent.parent
+MODEL_PATH = ROOT / "models" / "gmm_M16.npz"
+STATS_PATH = ROOT / "models" / "f0_stats.json"
 
 
 class InputError(ValueError):
